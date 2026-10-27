@@ -1,0 +1,21 @@
+# Locked environment for DiffPhysSkyHook (stage D0, verified 2026-10-27).
+# Recreate with: conda env create -f environment.yml
+#
+# D0 gate verification (tests/test_d0_smoke.py, all passed):
+#   - compiled-backend (x64/LLVM) hello-ODE RK4: x_err=8.5e-13, v_err=1.0e-9
+#   - adstack reverse-mode gradients: scalar y=x^2 -> 2x exact;
+#     dynamic-loop sum -> all 1.0 exact
+name: diffphy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.13
+  - pip
+  - pip:
+      - quadrants==1.3.0
+      - numpy==2.5.2
+      - scipy==1.18.0
+      - pytest==8.4.2
+      - matplotlib==3.11.1
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.3.1+cu121
