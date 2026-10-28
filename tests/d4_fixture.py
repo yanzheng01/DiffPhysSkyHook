@@ -7,7 +7,15 @@ exercise byte-identical inputs.
 Numerical caveat (D4 probe finding): flat-road elements get a nonzero IC
 (free decay) -- J = RMS(acc) = 0 would make dual(j_val_b) = sqrt'(0) =
 0/0 = nan and poison j_mean's dual chain.
+
+Plan B (E4) adds the shared command block FCMDS (B, N_STEPS): deterministic
+uniform commands on the N-force scale of the (c_min, c_max) window, with
+adversarial spikes on one element so every batch run mixes in-band and
+out-of-band steps. Same PARAMS / ROADS / X0S as the D4 fixture, so the
+flat-road elements keep their nonzero ICs (J > 0 dual caveat above).
 """
+
+import numpy as np
 
 from skyhook.params import SemiActiveParams
 from skyhook.road import BumpRoad, SineRoad, ZeroRoad
@@ -41,3 +49,43 @@ def perturbed(params_list, b: int, delta: float):
                               c_min=params_list[b].c_min,
                               c_max=params_list[b].c_max)
     return out
+
+
+# --- plan B (E4) shared force-command block -----------------------------------
+_FCMD_RNG = np.random.default_rng(42)
+FCMDS = _FCMD_RNG.uniform(-1.0, 1.0, size=(B, N_STEPS))
+FCMDS[3, ::10] *= 8.0  # adversarial spikes on b=3 -> out-of-band samples
+
+
+def perturbed_cmd(f_cmds, b: int, n: int, delta: float):
+    """Copy of the command block with f_cmds[b, n] shifted by delta."""
+    out = np.array(f_cmds, dtype=np.float64, copy=True)
+    out[b, n] += delta
+    return out
+
+
+class _Seed2D(np.ndarray):
+    """FwdMode seed adapter for 2-D fields (plan B E4, fc_b JVP probes).
+
+    The FwdMode seed API expects a flat list whose len() equals the field's
+    element count AND a numpy payload whose shape matches the field shape --
+    a flat list of 262144 scalars cannot satisfy both (np.array stays 1-D).
+    This ndarray subclass bridges the two: __bool__ -> True selects the
+    "seed set" branch, __len__ -> size satisfies the flat-length assert, and
+    np.array(seed, float32) keeps the (B_MAX, T_B_MAX) shape for from_numpy.
+    """
+
+    def __bool__(self):
+        return True
+
+    def __len__(self):
+        return self.size
+
+
+def fwd_seed_2d(b: int, n: int):
+    """Unit JVP seed e_(b, n) for the (B_MAX, T_B_MAX) command field."""
+    from skyhook import model2b  # local: keep the fixture module import-light
+
+    seed = np.zeros((model2b.B_MAX, model2b.T_B_MAX), dtype=np.float64)
+    seed[b, n] = 1.0
+    return seed.view(_Seed2D)

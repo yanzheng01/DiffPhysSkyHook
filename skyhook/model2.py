@@ -18,6 +18,14 @@ undefined. sim2 launches it through a qd.ad.grad_replaced wrapper whose
 custom gradient is identically zero (a loud, structural zero instead of
 silently differentiating through the select branch).
 
+Plan B extension (docs/plan_b_force_input_dev_test_plan.md section 2): an
+external force-command channel f_cmd drives the device directly,
+    F_d = clip(f_cmd[n], min(c_min,c_max)*v_rel, max(c_min,c_max)*v_rel)
+with the command held constant across the 4 RK4 stages of step n (step-wise
+ZOH). Realizability is enforced model-side (the clip IS the projection);
+mask_rec2 on the command rollout reports the command-out-of-band rate.
+The original rollout_semi (skyhook-law command) is untouched.
+
 Rollout pattern (empirical D2/T5 finding, mandatory):
   - the whole time loop lives in ONE kernel; per-step state occupies x_hist2
     slots, each written exactly once and never overwritten (intact primal
@@ -42,6 +50,14 @@ from .model import T_MAX, road_eval  # single source: same road math as model I
 # --- per-step state history (differentiable rollout; see module docstring) ---
 x_hist2 = qd.field(dtype=qd.f64, shape=(T_MAX, 4),
                    needs_grad=True, needs_dual=True)
+
+# --- external force-command channel (plan B section 2) -----------------------
+# f_cmd[n] = desired damper force for step n (t_n -> t_{n+1}); zero-order hold
+# across the 4 RK4 stages of that step. Written element-wise from the host
+# (set_fcmd_elem) BEFORE the rollout launch, exactly like set_state_hist2.
+# needs_grad: reverse Tape accumulates the whole (T,) adjoint dJ/df_cmd in one
+# backward pass (plan B decision 3); needs_dual: full-length JVP seeds (D4 rule).
+f_cmd = qd.field(dtype=qd.f64, shape=(T_MAX,), needs_grad=True, needs_dual=True)
 
 # --- record channels ---------------------------------------------------------
 traj2 = qd.field(dtype=qd.f64, shape=(T_MAX, 4))
@@ -97,6 +113,35 @@ def clip_mask(v1_: qd.f64, v2_: qd.f64):
 
 
 @qd.func
+def fd_clip_cmd(v1_: qd.f64, v2_: qd.f64, fc: qd.f64):
+    """Force-domain clip of the EXTERNAL command (plan B section 2-2).
+
+    Same admissible window as fd_clip; the command replaces the ideal skyhook
+    force as the clipped signal. Passivity holds BY CONSTRUCTION for any fc:
+    the window [min(cmin,cmax)*v_rel, max(cmin,cmax)*v_rel] always has the
+    sign of v_rel (or is zero), so F_d*v_rel >= 0. Subgradient (truncated)
+    AD semantics identical to fd_clip.
+    """
+    cmin = p_cmin2[None]
+    cmax = p_cmax2[None]
+    vr = v2_ - v1_
+    lo = qd.min(cmin * vr, cmax * vr)
+    hi = qd.max(cmin * vr, cmax * vr)
+    return qd.min(qd.max(fc, lo), hi)
+
+
+@qd.func
+def clip_mask_cmd(v1_: qd.f64, v2_: qd.f64, fc: qd.f64):
+    """1.0 where the COMMAND left [lo, hi] (command-out-of-band diagnostics)."""
+    cmin = p_cmin2[None]
+    cmax = p_cmax2[None]
+    vr = v2_ - v1_
+    lo = qd.min(cmin * vr, cmax * vr)
+    hi = qd.max(cmin * vr, cmax * vr)
+    return qd.select((fc < lo) | (fc > hi), 1.0, 0.0)
+
+
+@qd.func
 def fd_onoff(v1_: qd.f64, v2_: qd.f64):
     """ON-OFF law (section 4.3): returns (c(t), F_d)."""
     vr = v2_ - v1_
@@ -144,6 +189,18 @@ def set_state_hist2(ix1: qd.f64, ix2: qd.f64, iv1: qd.f64, iv2: qd.f64):
     x_hist2[0, 1] = ix2
     x_hist2[0, 2] = iv1
     x_hist2[0, 3] = iv2
+
+
+@qd.kernel
+def set_fcmd_elem(n: qd.i32, val: qd.f64):
+    """Write one command sample f_cmd[n] (element-wise host writes, plan B).
+
+    Executed BEFORE the rollout launch (outside any Tape), so the primal
+    command values are intact when the reverse pass reads them -- same
+    pattern as set_state_hist2. Element-wise launches are a known, accepted
+    overhead (plan B section 6).
+    """
+    f_cmd[n] = val
 
 
 @qd.kernel
@@ -213,6 +270,88 @@ def rollout_semi(n_steps: qd.i32, dt: qd.f64, kind: qd.i32, amp: qd.f64,
             v1e = v1_0 + dt * k3_v1
             v2e = v2_0 + dt * k3_v2
             f4 = fd_clip(v1e, v2e)
+            k4_x1 = v1e
+            k4_x2 = v2e
+            k4_v1 = rhs2_a1(x1e, x2e, v1e, v2e, z, zd, f4)
+            k4_v2 = rhs2_a2(x1e, x2e, f4)
+
+            # combine (each x_hist2 slot written once, then never touched again)
+            x_hist2[n + 1, 0] = x1_0 + (dt / 6.0) * (k1_x1 + 2.0 * k2_x1 + 2.0 * k3_x1 + k4_x1)
+            x_hist2[n + 1, 1] = x2_0 + (dt / 6.0) * (k1_x2 + 2.0 * k2_x2 + 2.0 * k3_x2 + k4_x2)
+            x_hist2[n + 1, 2] = v1_0 + (dt / 6.0) * (k1_v1 + 2.0 * k2_v1 + 2.0 * k3_v1 + k4_v1)
+            x_hist2[n + 1, 3] = v2_0 + (dt / 6.0) * (k1_v2 + 2.0 * k2_v2 + 2.0 * k3_v2 + k4_v2)
+
+
+@qd.kernel
+def rollout_cmd_semi(n_steps: qd.i32, dt: qd.f64, kind: qd.i32, amp: qd.f64,
+                     w: qd.f64, t0: qd.f64, width: qd.f64, ramp_t: qd.f64):
+    """Whole time loop in one kernel: command-driven semi-active rollout.
+
+    Same skeleton as rollout_semi (x_hist2 slots + single-iteration outer
+    loop); the damper force is fd_clip_cmd(stage v1, stage v2, f_cmd[n]) at
+    every RK4 stage. The command is read ONCE per step (ZOH, plan B section
+    2-1) and held constant across the stages. mask_rec2 becomes the command
+    out-of-band channel (clip_mask_cmd); fd_rec2 records the realized F_d.
+    """
+    for _ in range(1):
+        for n in range(n_steps):
+            x1_0 = x_hist2[n, 0]
+            x2_0 = x_hist2[n, 1]
+            v1_0 = x_hist2[n, 2]
+            v2_0 = x_hist2[n, 3]
+            fc = f_cmd[n]   # ZOH: constant across the 4 stages of step n
+
+            # whole-step records (t_n)
+            traj2[n, 0] = x1_0
+            traj2[n, 1] = x2_0
+            traj2[n, 2] = v1_0
+            traj2[n, 3] = v2_0
+            acc_rec2[n] = rhs2_a2(x1_0, x2_0, fd_clip_cmd(v1_0, v2_0, fc))
+            fd_rec2[n] = fd_clip_cmd(v1_0, v2_0, fc)
+            mask_rec2[n] = clip_mask_cmd(v1_0, v2_0, fc)
+
+            # stage 1 at t_n = n*dt (road at t_n shared with the ft record)
+            t = n * dt
+            z, zd = road_eval(t, kind, amp, w, t0, width, ramp_t)
+            ft_rec2[n] = p_mu2[None] * p_wtsq2[None] * (x1_0 - z)
+            f1 = fd_clip_cmd(v1_0, v2_0, fc)
+            k1_x1 = v1_0
+            k1_x2 = v2_0
+            k1_v1 = rhs2_a1(x1_0, x2_0, v1_0, v2_0, z, zd, f1)
+            k1_v2 = rhs2_a2(x1_0, x2_0, f1)
+
+            # stage 2 at t + dt/2
+            th = t + 0.5 * dt
+            z, zd = road_eval(th, kind, amp, w, t0, width, ramp_t)
+            x1s = x1_0 + 0.5 * dt * k1_x1
+            x2s = x2_0 + 0.5 * dt * k1_x2
+            v1s = v1_0 + 0.5 * dt * k1_v1
+            v2s = v2_0 + 0.5 * dt * k1_v2
+            f2 = fd_clip_cmd(v1s, v2s, fc)
+            k2_x1 = v1s
+            k2_x2 = v2s
+            k2_v1 = rhs2_a1(x1s, x2s, v1s, v2s, z, zd, f2)
+            k2_v2 = rhs2_a2(x1s, x2s, f2)
+
+            # stage 3 at t + dt/2
+            x1s = x1_0 + 0.5 * dt * k2_x1
+            x2s = x2_0 + 0.5 * dt * k2_x2
+            v1s = v1_0 + 0.5 * dt * k2_v1
+            v2s = v2_0 + 0.5 * dt * k2_v2
+            f3 = fd_clip_cmd(v1s, v2s, fc)
+            k3_x1 = v1s
+            k3_x2 = v2s
+            k3_v1 = rhs2_a1(x1s, x2s, v1s, v2s, z, zd, f3)
+            k3_v2 = rhs2_a2(x1s, x2s, f3)
+
+            # stage 4 at t + dt
+            te = t + dt
+            z, zd = road_eval(te, kind, amp, w, t0, width, ramp_t)
+            x1e = x1_0 + dt * k3_x1
+            x2e = x2_0 + dt * k3_x2
+            v1e = v1_0 + dt * k3_v1
+            v2e = v2_0 + dt * k3_v2
+            f4 = fd_clip_cmd(v1e, v2e, fc)
             k4_x1 = v1e
             k4_x2 = v2e
             k4_v1 = rhs2_a1(x1e, x2e, v1e, v2e, z, zd, f4)

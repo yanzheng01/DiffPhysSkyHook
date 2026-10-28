@@ -9,6 +9,10 @@ whose custom gradient is identically zero. Outside a Tape/FwdMode the wrapper
 is a plain forward call; inside a Tape the ON-OFF rollout contributes exact
 zero gradients (the switching law is discontinuous -- a loud structural zero
 instead of silently differentiating through the qd.select branch).
+
+run_semi_cmd (plan B): command-driven rollout -- the damper force command
+comes from the external series f_cmd[n] (step-wise ZOH) instead of the
+ideal skyhook law; realizability is enforced model-side by fd_clip_cmd.
 """
 
 from dataclasses import dataclass
@@ -73,6 +77,33 @@ def run_semi(params: SemiActiveParams, road, x0=(0.0, 0.0, 0.0, 0.0),
     """
     n_steps, road_args = _prepare(params, road, x0, t_end, dt)
     model2.rollout_semi(n_steps, dt, *road_args)
+    return _collect(n_steps, dt, with_ct=False)
+
+
+def run_semi_cmd(params: SemiActiveParams, f_cmd, road,
+                 x0=(0.0, 0.0, 0.0, 0.0),
+                 t_end: float = 2.0, dt: float = 1.0e-3) -> SemiResult:
+    """Forward rollout of model II driven by an external force-command series.
+
+    f_cmd[n] is the desired damper force for step n (t_n -> t_{n+1}), held
+    constant across the RK4 stages of that step (ZOH, plan B section 2-1).
+    Realizability is enforced model-side by fd_clip_cmd (no optimizer-side
+    projection); res.mask reports the command out-of-band rate. The command
+    is written element-by-element before the rollout launch (one kernel per
+    sample -- known overhead, plan B section 6).
+
+    For gradients wrap the same launch sequence (set_params2 / set_state_hist2
+    / set_fcmd_elem / rollout_cmd_semi / reduce_j2 / finalize_j2) in
+    qd.ad.Tape (reverse: whole (T,) adjoint in one backward pass) or
+    qd.ad.FwdMode (JVP spot checks), as in tests/test_e2_force_grad.py.
+    """
+    n_steps, road_args = _prepare(params, road, x0, t_end, dt)
+    fc = np.asarray(f_cmd, dtype=np.float64)
+    if fc.shape != (n_steps,):
+        raise ValueError(f"f_cmd must have shape ({n_steps},), got {fc.shape}")
+    for n in range(n_steps):
+        model2.set_fcmd_elem(n, float(fc[n]))
+    model2.rollout_cmd_semi(n_steps, dt, *road_args)
     return _collect(n_steps, dt, with_ct=False)
 
 
