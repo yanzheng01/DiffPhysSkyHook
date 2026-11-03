@@ -1,4 +1,8 @@
+# training artifacts (checkpoints are reproducible, large, seed-stamped)
+checkpoints/
+
+# report scaffolding leftovers
+.trae-html-share-packages/
+
 __pycache__/
 *.pyc
-.pytest_cache/
-.screenshots/
