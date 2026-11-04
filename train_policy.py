@@ -26,6 +26,7 @@ Usage:  python train_policy.py --mode 2 --iterations 200
 
 import argparse
 import copy
+import glob
 import os
 from dataclasses import asdict, dataclass, field
 
@@ -70,6 +71,10 @@ class TrainConfig:
     w_mag: float = 0.001
     decay: float = 1.0                # within-segment adjoint decay
     device: str = "cpu"               # plan D G3: "cuda" for GPU training
+    resume: bool = False              # plan D G3: exact resume from the
+                                      # newest periodic checkpoint (opt +
+                                      # sched + rng + history state, so a
+                                      # killed run continues bit-identical)
     seed: int = 0
     fixed_road_seed: int = 11         # None -> resample every episode
     select_seed: int = SELECT_SEED    # plan D G1: frozen validation batch
@@ -204,7 +209,37 @@ def train(cfg: TrainConfig, verbose: bool = True):
     best_j = float("inf")
     best_it = 0
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
-    for it in range(cfg.n_iter):
+
+    # plan D G3: crash-resilient resume (background tasks in the dev
+    # environment get reaped on idle; 800-iter B=32 runs exceed one
+    # sitting). Restores the exact optimiser/scheduler/rng/history state
+    # so the continued run is bit-identical to an uninterrupted one.
+    start_it = 0
+    if cfg.resume:
+        cands = sorted(
+            glob.glob(os.path.join(cfg.ckpt_dir,
+                                   f"policy_m{cfg.mode}_it*.pt")),
+            key=lambda p: int(p.rsplit("it", 1)[1].split(".")[0]))
+        while cands:
+            latest = cands.pop()
+            ck = torch.load(latest, weights_only=False)
+            if "opt" not in ck:      # legacy checkpoint: not resumable
+                continue
+            start_it = int(latest.rsplit("it", 1)[1].split(".")[0])
+            policy.load_state_dict(ck["model"])
+            opt.load_state_dict(ck["opt"])
+            sched.load_state_dict(ck["sched"])
+            rng.bit_generator.state = ck["rng"]
+            torch.set_rng_state(ck["torch_rng"])
+            history = ck["history"]
+            best_j = ck["best_j"]
+            best_it = ck["best_it"]
+            if verbose:
+                print(f"[resume m{cfg.mode}] exact resume from it "
+                      f"{start_it}/{cfg.n_iter}")
+            break
+
+    for it in range(start_it, cfg.n_iter):
         if fixed is None:
             roads, ics = sample_roads(cfg, rng), sample_ics(cfg, rng)
         loss_sim, j_ctl, stats = run_episode(policy, cfg, roads, ics,
@@ -263,7 +298,11 @@ def train(cfg: TrainConfig, verbose: bool = True):
             path = os.path.join(cfg.ckpt_dir,
                                 f"policy_m{cfg.mode}_it{it + 1}.pt")
             torch.save({"model": policy.state_dict(),
-                        "cfg": asdict(cfg), "history": history}, path)
+                        "cfg": asdict(cfg), "history": history,
+                        "opt": opt.state_dict(), "sched": sched.state_dict(),
+                        "rng": rng.bit_generator.state,
+                        "torch_rng": torch.get_rng_state(),
+                        "best_j": best_j, "best_it": best_it}, path)
     return policy, history
 
 

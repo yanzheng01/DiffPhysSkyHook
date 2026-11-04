@@ -312,7 +312,7 @@ def oracle_optimize(road_seqs, params_list, x0s, xmaxs=None,
                     weights=sim3.DEFAULT_WEIGHTS, dt: float = 1.0e-3,
                     w_jerk: float = 0.0, w_mag: float = 0.0,
                     n_iter: int = 100, lr: float = 5.0e-2,
-                    verbose: bool = True):
+                    traj_every: int = 0, verbose: bool = True):
     """Whole-window open-loop f optimization through the bridge.
 
     w_jerk = w_mag = 0 -> the PGD upper bound (pure J_sim); nonzero ->
@@ -326,6 +326,13 @@ def oracle_optimize(road_seqs, params_list, x0s, xmaxs=None,
     out-of-band plateau where the adjoint is exactly zero (T19 saturated
     slots), and the passive floor rides the clip kink -- the midpoint is
     strictly inside the window, so the gradient flows from step one.
+
+    traj_every > 0 additionally records the convergence trajectory (the
+    optimized objective AND the pure four-term j_sim under no_grad, so
+    the planner trajectory is tracked on the composite metric the info
+    gap is stated in, plan D G4); the return becomes (f, traj) with traj
+    a list of {"iter", "obj", "j_sim"} dicts. Default 0 keeps the
+    historical return signature (f only).
     """
     B = len(params_list)
     N = road_seqs[0].n_steps
@@ -342,6 +349,7 @@ def oracle_optimize(road_seqs, params_list, x0s, xmaxs=None,
     f.requires_grad_(True)
     opt = torch.optim.AdamW([f], lr=lr)
     x0_tuples = [tuple(x0s[b]) for b in range(B)]
+    traj = []
     for it in range(n_iter):
         opt.zero_grad()
         loss = bridge.sim_loss(f, road_seqs, params_list, x0_tuples,
@@ -350,10 +358,18 @@ def oracle_optimize(road_seqs, params_list, x0s, xmaxs=None,
             loss = loss + control_loss(f, dt, w_jerk, w_mag)
         loss.backward()
         opt.step()
+        if traj_every > 0 and (it % traj_every == 0 or it == n_iter - 1):
+            with torch.no_grad():
+                j = float(bridge.sim_loss(
+                    f, road_seqs, params_list, x0_tuples, xmaxs=xmaxs,
+                    weights=weights, dt=dt, i0=0).item())
+            traj.append({"iter": it + 1, "obj": float(loss.item()),
+                         "j_sim": j})
         if verbose and ((it + 1) % 25 == 0 or it == 0):
             print(f"[oracle{'+' if (w_jerk or w_mag) else ''}] "
                   f"it {it + 1:4d}/{n_iter}  J={float(loss.item()):.6e}")
-    return f.detach().cpu().numpy().copy()
+    f = f.detach().cpu().numpy().copy()
+    return (f, traj) if traj_every > 0 else f
 
 
 # ---------------------------------------------------------------------------

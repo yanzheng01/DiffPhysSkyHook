@@ -30,7 +30,7 @@ import torch
 
 from skyhook.params import SemiActiveParams
 from skyhook.policy import PolicyMLP
-from train_policy import TrainConfig, run_episode, sample_ics, sample_roads
+from train_policy import TrainConfig, run_episode, sample_ics, sample_roads, train
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -87,6 +87,48 @@ class TestT31BatchEquivalence:
             s = torch.max(torch.abs(g32[n])).item()
             print(f"[T31] grad[{n}]: max|diff|={d:.3e} scale={s:.3e}")
             assert d <= 1e-9 * max(1.0, s)
+
+
+    def test_resume_equivalence(self, tmp_path, monkeypatch):
+        """Killed-and-resumed run == uninterrupted run, bit-exact.
+
+        Simulates a crash DURING it21 of a full n_iter=40 run (same
+        config, so the cosine schedule matches -- a smaller first call
+        would legitimately diverge via T_max): raise from run_episode
+        on its 21st invocation, after the it20 periodic checkpoint.
+        Resuming must reproduce the uninterrupted history exactly --
+        the guarantee that makes the reaped-background-task recoveries
+        in G3 trustworthy.
+        """
+        import train_policy as tp
+
+        common = dict(mode=1, B=2, H=20, t_w=0.2, seed=0,
+                      fixed_road_seed=None)
+        dir_a = str(tmp_path / "a")
+        _, hist_a = train(TrainConfig(n_iter=40, ckpt_dir=dir_a, **common))
+
+        dir_b = str(tmp_path / "b")
+        orig = tp.run_episode
+        calls = {"n": 0}
+
+        def boom(*a, **k):
+            calls["n"] += 1
+            if calls["n"] > 20:
+                raise RuntimeError("simulated kill")
+            return orig(*a, **k)
+
+        monkeypatch.setattr(tp, "run_episode", boom)
+        with pytest.raises(RuntimeError):
+            train(TrainConfig(n_iter=40, ckpt_every=10,
+                              ckpt_dir=dir_b, **common))
+        monkeypatch.setattr(tp, "run_episode", orig)
+
+        _, hist_b = train(TrainConfig(n_iter=40, ckpt_dir=dir_b,
+                                      resume=True, **common))
+        assert len(hist_b["j_sim"]) == 40
+        assert hist_a["j_sim"] == hist_b["j_sim"]
+        assert hist_a["select_j_sim"] == hist_b["select_j_sim"]
+        assert hist_a["jerk"] == hist_b["jerk"]
 
 
 def _load():
